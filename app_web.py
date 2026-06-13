@@ -440,13 +440,34 @@ def zip_output_dir(output_dir):
 
 def main():
     st.markdown("""
-        <div style='background:#123a45;padding:24px 32px 18px;
+        <div style='background:#123a45;padding:24px 32px 22px;
                     border-radius:8px;margin-bottom:24px'>
             <h1 style='color:#f8fafc;margin:0;font-size:2rem'>
                 🏔️ 滑坡易发性分析工具
             </h1>
-            <p style='color:#cbd5e1;margin:6px 0 0'>
+            <p style='color:#cbd5e1;margin:6px 0 10px;font-size:0.95rem'>
                 Information Value Model · Spatial Sampling · GIS Workflow
+            </p>
+            <hr style='border:none;border-top:1px solid #2dd4bf44;margin:12px 0'>
+            <p style='color:#e2e8f0;margin:0;font-size:0.92rem;line-height:1.7'>
+                基于 <b style='color:#2dd4bf'>信息量模型（IVM）</b>
+                的滑坡易发性在线评价工具，面向地质灾害研究人员设计。<br>
+                上传环境因子栅格与滑坡正样本，自动完成因子分级、IV 计算、
+                易发性图生成与负样本空间采样，全流程无需本地安装任何软件。
+            </p>
+            <p style='margin:10px 0 0;font-size:0.85rem'>
+                <span style='background:#0f766e;color:#ccfbf1;
+                             padding:3px 10px;border-radius:4px;margin-right:8px'>
+                    IVM 信息量评价
+                </span>
+                <span style='background:#1e40af;color:#bfdbfe;
+                             padding:3px 10px;border-radius:4px;margin-right:8px'>
+                    负样本自动生成
+                </span>
+                <span style='background:#374151;color:#d1d5db;
+                             padding:3px 10px;border-radius:4px'>
+                    开源免费 · MIT License
+                </span>
             </p>
         </div>
     """, unsafe_allow_html=True)
