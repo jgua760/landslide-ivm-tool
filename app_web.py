@@ -289,74 +289,75 @@ class NegativeSampleService:
     def __init__(self, log_callback=None):
         self.log = log_callback if log_callback else print
 
-    def generate_negative_samples(self, factor_dir, ivm_tif_path, pos_shp_path,
-                                  out_shp_path, sample_mode="ivm_low", buffer_m=500):
-        self.log(">>> [1/5] 读取滑坡正样本...")
+    def generate_negative_samples(self, pos_shp_path, out_shp_path,
+                                  sample_mode="ivm_low", buffer_m=500,
+                                  classified_tif_path=None, ref_tif_path=None):
+        """
+        三种使用场景：
+        1. IVM分级图模式（ivm_low / ivm_very_low）：需要classified_tif_path
+           分级值1=极低，2=低，直接筛选采样区域
+        2. 全区随机+分级图：classified_tif_path提供空间范围
+        3. 全区随机+原始TIF：ref_tif_path提供空间范围，不需要分级图
+        """
+        self.log(">>> [1/4] 读取滑坡正样本...")
         gdf_pos = gpd.read_file(pos_shp_path)
         target_n = len(gdf_pos)
         self.log(f"  -> 需生成负样本: {target_n} 个")
 
-        self.log(">>> [2/5] 建立全局有效掩膜...")
-        tif_files = [f for f in os.listdir(factor_dir) if f.lower().endswith('.tif')]
-        if not tif_files:
-            raise ValueError("环境因子目录中未找到TIF文件！")
+        self.log(">>> [2/4] 构建全局有效掩膜...")
 
-        with rasterio.open(os.path.join(factor_dir, tif_files[0])) as src_ref:
-            transform, crs, shape = src_ref.transform, src_ref.crs, src_ref.shape
+        # ── 情景A：有分级图（IVM约束或全区随机均可用）──
+        if classified_tif_path and os.path.exists(classified_tif_path):
+            self.log("  -> 使用 IVM 分级图构建掩膜...")
+            with rasterio.open(classified_tif_path) as src:
+                data_class = src.read(1).astype(np.float32)
+                transform = src.transform
+                crs = src.crs
+                shape = src.shape
+            global_valid_mask = (data_class >= 1) & (data_class <= 5)
+            self.log(f"  -> 全局有效像元: {global_valid_mask.sum()} 个")
 
-        global_valid_mask = np.ones(shape, dtype=bool)
-        for fname in tif_files:
-            with rasterio.open(os.path.join(factor_dir, fname)) as src_f:
-                if src_f.shape != shape or src_f.transform != transform:
-                    data_f = np.empty(shape, dtype=np.float32)
-                    reproject(
-                        source=rasterio.band(src_f, 1), destination=data_f,
-                        src_transform=src_f.transform, src_crs=src_f.crs,
-                        dst_transform=transform, dst_crs=crs,
-                        resampling=Resampling.nearest)
-                    nodata_f = src_f.nodata if src_f.nodata is not None else -9999.0
-                else:
-                    data_f = src_f.read(1)
-                    nodata_f = src_f.nodata if src_f.nodata is not None else -9999.0
-                factor_valid = (~np.isnan(data_f)) & (data_f > -100000.0)
-                if nodata_f is not None:
-                    factor_valid &= ~np.isclose(data_f, nodata_f)
-                global_valid_mask &= factor_valid
+            self.log(">>> [3/4] 建立采样空间约束...")
+            if sample_mode == "ivm_low":
+                safe_area_mask = (data_class == 1) | (data_class == 2)
+                self.log("  -> 约束模式：极低 + 低易发区（分级值 1、2）")
+            elif sample_mode == "ivm_very_low":
+                safe_area_mask = (data_class == 1)
+                self.log("  -> 约束模式：仅极低易发区（分级值 1）")
+            else:
+                safe_area_mask = global_valid_mask.copy()
+                self.log("  -> 约束模式：全区随机（基于分级图有效范围）")
 
-        self.log(">>> [3/5] 建立采样空间约束...")
-        safe_area_mask = np.ones(shape, dtype=bool)
-        if sample_mode in ["ivm_very_low", "ivm_low"]:
-            if not ivm_tif_path or not os.path.exists(ivm_tif_path):
-                raise ValueError("IVM约束模式需要提供有效的IVM TIF路径！")
-            with rasterio.open(ivm_tif_path) as src_ivm:
-                if src_ivm.shape != shape or src_ivm.transform != transform:
-                    data_ivm = np.empty(shape, dtype=np.float32)
-                    reproject(
-                        source=rasterio.band(src_ivm, 1), destination=data_ivm,
-                        src_transform=src_ivm.transform, src_crs=src_ivm.crs,
-                        dst_transform=transform, dst_crs=crs,
-                        resampling=Resampling.nearest)
-                    nodata_ivm = src_ivm.nodata if src_ivm.nodata is not None else -9999.0
-                else:
-                    data_ivm = src_ivm.read(1)
-                    nodata_ivm = src_ivm.nodata if src_ivm.nodata is not None else -9999.0
-            valid_data_mask = (
-                (data_ivm != nodata_ivm) & (~np.isnan(data_ivm)) & (data_ivm > -10000.0))
-            valid_pixels = data_ivm[valid_data_mask]
-            classifier = mapclassify.NaturalBreaks(valid_pixels, k=5)
-            bins = classifier.bins
-            threshold_safe = bins[0] if sample_mode == "ivm_very_low" else bins[1]
-            self.log(f"  -> IVM阈值 <= {threshold_safe:.4f}")
-            safe_area_mask = (data_ivm <= threshold_safe) & valid_data_mask
+        # ── 情景B：无分级图，只有原始TIF，仅支持全区随机 ──
+        elif ref_tif_path and os.path.exists(ref_tif_path):
+            self.log("  -> 使用原始 TIF 构建空间范围掩膜（全区随机模式）...")
+            with rasterio.open(ref_tif_path) as src:
+                data_ref = src.read(1).astype(np.float32)
+                transform = src.transform
+                crs = src.crs
+                shape = src.shape
+                nodata_ref = src.nodata if src.nodata is not None else -9999.0
+            global_valid_mask = (
+                (~np.isnan(data_ref)) &
+                (data_ref > -100000.0) &
+                (~np.isclose(data_ref, nodata_ref))
+            )
+            safe_area_mask = global_valid_mask.copy()
+            self.log(f"  -> 全局有效像元: {global_valid_mask.sum()} 个")
+            self.log("  -> 约束模式：全区随机（基于原始TIF有效范围）")
 
-        self.log(f">>> [4/5] 生成正样本避让缓冲区 ({buffer_m}m)...")
+        else:
+            raise ValueError(
+                "请提供 IVM 分级图 TIF 或至少一个原始环境因子 TIF！")
+
+        self.log(f">>> [4/4] 生成正样本避让缓冲区 ({buffer_m}m) 并抽取负样本...")
         buffered_pos = gdf_pos.copy()
         buffered_pos['geometry'] = buffered_pos.geometry.buffer(buffer_m)
         valid_outside_pos = geometry_mask(
             geometries=buffered_pos.geometry, out_shape=shape,
             transform=transform, all_touched=True, invert=False)
 
-        self.log(">>> [5/5] 抽取负样本...")
+        self.log("  -> 整合掩膜，抽取负样本...")
         candidate_pool = binary_erosion(
             safe_area_mask & valid_outside_pos & global_valid_mask, iterations=2)
         candidate_coords = np.argwhere(candidate_pool)
@@ -502,33 +503,46 @@ def main():
                     progress_bar.progress(val, text=f"处理中... {int(val*100)}%")
 
                 try:
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        tif_dir = save_uploaded_tifs(tif_files, tmpdir)
-                        shp_path = save_uploaded_shp(shp_zip, tmpdir, "pos_shp")
-                        output_dir = os.path.join(tmpdir, "ivm_output")
-                        os.makedirs(output_dir, exist_ok=True)
+                    # 用持久化临时目录，让session_state保存路径后仍可访问
+                    if 'ivm_tmpdir' not in st.session_state:
+                        st.session_state.ivm_tmpdir = tempfile.mkdtemp()
+                    tmpdir = st.session_state.ivm_tmpdir
 
-                        service = GISAnalysisService(log_fn)
-                        service.run_batch_analysis(
-                            tif_dir, shp_path, output_dir, prog_fn)
+                    tif_dir = save_uploaded_tifs(tif_files, tmpdir)
+                    shp_path = save_uploaded_shp(shp_zip, tmpdir, "pos_shp")
+                    output_dir = os.path.join(tmpdir, "ivm_output")
+                    os.makedirs(output_dir, exist_ok=True)
 
-                        progress_bar.progress(1.0, text="✅ 完成！")
-                        st.success("IVM 计算完成！点击下方按钮下载所有结果。")
+                    service = GISAnalysisService(log_fn)
+                    service.run_batch_analysis(tif_dir, shp_path, output_dir, prog_fn)
 
-                        result_zip = zip_output_dir(output_dir)
-                        st.download_button(
-                            label="📥 下载全部结果（ZIP）",
-                            data=result_zip,
-                            file_name="IVM_Results.zip",
-                            mime="application/zip",
-                            use_container_width=True
-                        )
+                    # ✅ 把分级图路径和正样本路径存入session_state，供负样本模块直接使用
+                    class_tif = os.path.join(
+                        output_dir, "Classified_Susceptibility_Map_5Class.tif")
+                    if os.path.exists(class_tif):
+                        st.session_state.classified_tif_path = class_tif
+                        st.session_state.pos_shp_path = shp_path
+                        st.success(
+                            "✅ IVM 计算完成！分级图已自动传递给「负样本生成」模块，"
+                            "切换到该标签页即可直接生成负样本。")
+                    else:
+                        st.warning("IVM完成但未生成分级图，负样本模块需手动上传。")
 
-                        csv_path = os.path.join(output_dir, "IV_Statistics.csv")
-                        if os.path.exists(csv_path):
-                            st.subheader("📋 IV 统计表预览")
-                            st.dataframe(
-                                pd.read_csv(csv_path), use_container_width=True)
+                    progress_bar.progress(1.0, text="✅ 完成！")
+
+                    result_zip = zip_output_dir(output_dir)
+                    st.download_button(
+                        label="📥 下载全部结果（ZIP）",
+                        data=result_zip,
+                        file_name="IVM_Results.zip",
+                        mime="application/zip",
+                        use_container_width=True
+                    )
+
+                    csv_path = os.path.join(output_dir, "IV_Statistics.csv")
+                    if os.path.exists(csv_path):
+                        st.subheader("📋 IV 统计表预览")
+                        st.dataframe(pd.read_csv(csv_path), use_container_width=True)
 
                 except Exception as e:
                     st.error(f"运行出错：{e}")
@@ -537,49 +551,120 @@ def main():
     # ── Tab 2: 负样本生成 ────────────────────────────────────
     with tab_sample:
         st.subheader("负样本生成")
-        st.caption(
-            "基于 IVM 易发性分区和正样本缓冲区，自动生成空间分布合理的负样本点。")
+        st.caption("基于 IVM 分级图和正样本缓冲区，自动生成空间分布合理的负样本点。")
+
+        # 检查是否有IVM传递过来的结果
+        has_ivm_result = (
+            'classified_tif_path' in st.session_state and
+            os.path.exists(st.session_state.get('classified_tif_path', ''))
+        )
+
+        if has_ivm_result:
+            st.success(
+                "✅ 已自动获取 IVM 分级图，无需手动上传。"
+                "直接选择采样策略即可生成负样本。")
+        else:
+            st.info("💡 建议先在「IVM 信息量评价」模块完成计算，分级图会自动传递到此处。"
+                    "也可在下方手动上传分级图，或选择「全区随机」模式直接上传任意 TIF。")
+
+        # ── 采样策略选择（放最上面，决定下方显示哪些上传框）──
+        sample_mode = st.selectbox(
+            "采样策略",
+            options=["ivm_low", "ivm_very_low", "random"],
+            format_func=lambda x: {
+                "ivm_low":      "极低 + 低易发区（推荐，需要IVM分级图）",
+                "ivm_very_low": "仅极低易发区（需要IVM分级图）",
+                "random":       "全区随机（只需任意一个TIF即可）"
+            }[x]
+        )
 
         col1, col2 = st.columns(2)
+
         with col1:
-            s_tif_files = st.file_uploader(
-                "📂 上传环境因子 TIF（可多选）",
-                type=["tif", "tiff"],
-                accept_multiple_files=True,
-                key="sample_tif"
-            )
-            s_pos_shp = st.file_uploader(
-                "📌 上传滑坡正样本 SHP（ZIP）",
-                type=["zip"],
-                key="sample_pos_shp"
-            )
+            # 正样本：IVM传递过来就直接用，否则上传
+            if has_ivm_result and 'pos_shp_path' in st.session_state:
+                st.markdown("**📌 正样本 SHP**：已从 IVM 模块自动获取")
+                s_pos_shp = None
+            else:
+                s_pos_shp = st.file_uploader(
+                    "📌 上传滑坡正样本 SHP（ZIP，含 .shp/.dbf/.shx/.prj）",
+                    type=["zip"],
+                    key="sample_pos_shp"
+                )
+
         with col2:
-            s_ivm_tif = st.file_uploader(
-                "🗺️ 上传 IVM 易发性结果图 TIF（IVM策略必填）",
-                type=["tif", "tiff"],
-                key="sample_ivm"
-            )
-            sample_mode = st.selectbox(
-                "采样策略",
-                options=["ivm_low", "ivm_very_low", "random"],
-                format_func=lambda x: {
-                    "ivm_low":      "极低 + 低易发区（推荐）",
-                    "ivm_very_low": "仅极低易发区",
-                    "random":       "全区随机"
-                }[x]
-            )
+            if sample_mode in ["ivm_low", "ivm_very_low"]:
+                # IVM约束模式：需要分级图
+                if has_ivm_result:
+                    st.markdown("**🗺️ IVM 分级图**：已从 IVM 模块自动获取")
+                    s_class_tif = None
+                    s_ref_tif = None
+                else:
+                    s_class_tif = st.file_uploader(
+                        "🗺️ 手动上传 IVM 分级图 TIF（5Class）",
+                        type=["tif", "tiff"],
+                        key="sample_class_tif"
+                    )
+                    s_ref_tif = None
+            else:
+                # 全区随机模式：有分级图用分级图，没有就用任意TIF
+                s_class_tif = None
+                if has_ivm_result:
+                    st.markdown("**🗺️ 空间范围**：已从 IVM 分级图自动获取")
+                    s_ref_tif = None
+                else:
+                    s_ref_tif = st.file_uploader(
+                        "📂 上传任意一个环境因子 TIF（用于确定空间范围）",
+                        type=["tif", "tiff"],
+                        key="sample_ref_tif",
+                        help="全区随机模式只需要一个TIF来确定研究区范围，无需全部因子"
+                    )
+
             buffer_m = st.number_input(
                 "避让缓冲距离（米）", value=500, min_value=0, step=50)
 
         st.divider()
 
         if st.button("🚀 开始生成负样本", type="primary", use_container_width=True):
-            if not s_tif_files:
-                st.error("请上传环境因子 TIF 文件。")
-            elif s_pos_shp is None:
+
+            # ── 确定分级图路径 ──
+            classified_tif_path = st.session_state.get('classified_tif_path', '')
+            ref_tif_path = None
+
+            if s_class_tif is not None:
+                manual_tmpdir = tempfile.mkdtemp()
+                classified_tif_path = os.path.join(manual_tmpdir, "class.tif")
+                with open(classified_tif_path, "wb") as f:
+                    f.write(s_class_tif.read())
+
+            if s_ref_tif is not None:
+                ref_tmpdir = tempfile.mkdtemp()
+                ref_tif_path = os.path.join(ref_tmpdir, "ref.tif")
+                with open(ref_tif_path, "wb") as f:
+                    f.write(s_ref_tif.read())
+
+            # 全区随机：有分级图也可以用，没有就用ref_tif
+            if sample_mode == "random" and not classified_tif_path:
+                classified_tif_path = None  # 让服务类走ref_tif路径
+
+            # ── 确定正样本路径 ──
+            pos_shp_path = st.session_state.get('pos_shp_path', '')
+            if s_pos_shp is not None:
+                manual_shp_tmpdir = tempfile.mkdtemp()
+                pos_shp_path = save_uploaded_shp(s_pos_shp, manual_shp_tmpdir, "pos2")
+
+            # ── 输入校验 ──
+            need_class_tif = sample_mode in ["ivm_low", "ivm_very_low"]
+            has_class = classified_tif_path and os.path.exists(classified_tif_path)
+            has_ref = ref_tif_path and os.path.exists(ref_tif_path)
+            has_pos = pos_shp_path and os.path.exists(pos_shp_path)
+
+            if need_class_tif and not has_class:
+                st.error("IVM 约束模式需要 IVM 分级图，请先完成 IVM 计算或手动上传分级图 TIF。")
+            elif sample_mode == "random" and not has_class and not has_ref:
+                st.error("全区随机模式请上传至少一个环境因子 TIF 用于确定空间范围。")
+            elif not has_pos:
                 st.error("请上传正样本 SHP（ZIP格式）。")
-            elif sample_mode in ["ivm_low", "ivm_very_low"] and s_ivm_tif is None:
-                st.error("IVM 约束策略需要上传 IVM 易发性结果图 TIF。")
             else:
                 log_box2 = st.empty()
                 log_lines2 = []
@@ -591,45 +676,37 @@ def main():
                         height=260, key=f"sample_log_{len(log_lines2)}")
 
                 try:
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        tif_dir = save_uploaded_tifs(s_tif_files, tmpdir)
-                        shp_path = save_uploaded_shp(s_pos_shp, tmpdir, "pos_shp2")
-                        out_shp_path = os.path.join(tmpdir, "negative_samples.shp")
+                    out_tmpdir = tempfile.mkdtemp()
+                    out_shp_path = os.path.join(out_tmpdir, "negative_samples.shp")
 
-                        ivm_tif_path = ""
-                        if s_ivm_tif is not None:
-                            ivm_tif_path = os.path.join(tmpdir, "ivm_result.tif")
-                            with open(ivm_tif_path, "wb") as f:
-                                f.write(s_ivm_tif.read())
+                    service = NegativeSampleService(log_fn2)
+                    service.generate_negative_samples(
+                        pos_shp_path=pos_shp_path,
+                        out_shp_path=out_shp_path,
+                        sample_mode=sample_mode,
+                        buffer_m=int(buffer_m),
+                        classified_tif_path=classified_tif_path if has_class else None,
+                        ref_tif_path=ref_tif_path
+                    )
 
-                        service = NegativeSampleService(log_fn2)
-                        service.generate_negative_samples(
-                            factor_dir=tif_dir,
-                            ivm_tif_path=ivm_tif_path,
-                            pos_shp_path=shp_path,
-                            out_shp_path=out_shp_path,
-                            sample_mode=sample_mode,
-                            buffer_m=int(buffer_m)
-                        )
+                    st.success("负样本生成完成！")
 
-                        st.success("负样本生成完成！")
+                    shp_zip_path = os.path.join(out_tmpdir, "negative_samples.zip")
+                    with zipfile.ZipFile(shp_zip_path, 'w') as zf:
+                        for ext in ['.shp', '.dbf', '.shx', '.prj', '.cpg']:
+                            fp = out_shp_path.replace('.shp', ext)
+                            if os.path.exists(fp):
+                                zf.write(fp, os.path.basename(fp))
+                    with open(shp_zip_path, "rb") as f:
+                        shp_zip_buf = f.read()
 
-                        shp_zip_path = os.path.join(tmpdir, "negative_samples_shp.zip")
-                        with zipfile.ZipFile(shp_zip_path, 'w') as zf:
-                            for ext in ['.shp', '.dbf', '.shx', '.prj', '.cpg']:
-                                fp = out_shp_path.replace('.shp', ext)
-                                if os.path.exists(fp):
-                                    zf.write(fp, os.path.basename(fp))
-                        with open(shp_zip_path, "rb") as f:
-                            shp_zip_buf = f.read()
-
-                        st.download_button(
-                            label="📥 下载负样本 SHP（ZIP）",
-                            data=shp_zip_buf,
-                            file_name="negative_samples.zip",
-                            mime="application/zip",
-                            use_container_width=True
-                        )
+                    st.download_button(
+                        label="📥 下载负样本 SHP（ZIP）",
+                        data=shp_zip_buf,
+                        file_name="negative_samples.zip",
+                        mime="application/zip",
+                        use_container_width=True
+                    )
 
                 except Exception as e:
                     st.error(f"运行出错：{e}")
