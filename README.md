@@ -14,7 +14,7 @@
 
 **无需安装任何软件，打开即用：**
 
-👉 [https://landslide-ivm-tool-brutchr7glrzjy6pr5gqlq.streamlit.app](https://landslide-ivm-tool-brutchr7glrzjy6pr5gqlq.streamlit.app)
+👉 [https://landslide-ivm-tool.streamlit.app](https://landslide-ivm-tool.streamlit.app)
 
 ---
 
