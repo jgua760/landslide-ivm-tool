@@ -1,0 +1,3 @@
+libgdal-dev
+gdal-bin
+python3-gdal
